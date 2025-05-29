@@ -1,30 +1,84 @@
 import os
 import uuid
 import json
+import requests
+import logging
+import re
 from flask import Flask, render_template, request, jsonify, send_from_directory
-from worker import process_document, get_qa_chain
+from PyPDF2 import PdfReader
 
 UPLOAD_FOLDER = "uploads"
-VECTORDB_FOLDER = "vectordbs"
 STATE_FILE = "chatbot_state.json"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(VECTORDB_FOLDER, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = "super-secret-key"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Helper functions to persist state across processes
-def save_state(file_id, chat_history):
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Helper functions to persist state in a file
+def save_state(file_id, state):
     with open(STATE_FILE, "w") as f:
-        json.dump({"last_file_id": file_id, "chat_history": chat_history}, f)
+        json.dump({"file_id": file_id, **state}, f)
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return None, []
+        return None, {}
     with open(STATE_FILE, "r") as f:
-        data = json.load(f)
-        return data.get("last_file_id"), data.get("chat_history", [])
+        state = json.load(f)
+    return state.get("file_id"), {k: v for k, v in state.items() if k != "file_id"}
+
+# Function to extract text from a PDF file
+def extract_text_from_pdf(pdf_path):
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
+# Function to clean text before processing
+def clean_text(text):
+    # Remove special characters and extra whitespace
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Convert text to lowercase
+    text = text.lower()
+    return text
+
+# Correctly handle the HuggingFace API response
+def summarize_with_huggingface(prompt):
+    api_key = os.environ.get("HF_TOKEN")
+    if not api_key:
+        raise Exception("HuggingFace API key (HF_TOKEN) is not set. Please set it as an environment variable.")
+
+    # Clean and truncate the input text
+    max_input_length = 1024
+    cleaned_prompt = clean_text(prompt)
+    truncated_prompt = cleaned_prompt[:max_input_length]
+
+    url = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {"inputs": truncated_prompt}
+
+    logging.debug(f"API Key: {api_key}")
+    logging.debug(f"Payload: {payload}")
+    response = requests.post(url, headers=headers, json=payload)
+    logging.debug(f"Response Status Code: {response.status_code}")
+    logging.debug(f"Response Text: {response.text}")
+
+    if response.status_code == 200:
+        # Ensure the response is correctly parsed
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get("summary_text", "No summary generated.")
+        else:
+            raise Exception("Unexpected response format from HuggingFace API.")
+    elif response.status_code == 401:
+        raise Exception("Invalid HuggingFace API key. Please verify your HF_TOKEN.")
+    else:
+        raise Exception(f"HuggingFace API error: {response.status_code}, {response.text}")
 
 @app.route("/")
 def index():
@@ -43,40 +97,38 @@ def upload():
     filename = f"{file_id}{ext}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
-    vectordb_dir = os.path.join(VECTORDB_FOLDER, file_id)
-    process_document(filepath, vectordb_dir)
 
-    save_state(file_id, [])  # Persist file id and empty chat history
+    # Extract text from the uploaded PDF
+    pdf_text = extract_text_from_pdf(filepath)
+
+    # Save the extracted text along with the file ID
+    save_state(file_id, {"text": pdf_text, "chat_history": []})
     return jsonify({"success": True})
 
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
     user_input = data.get("message", "")
-    file_id, chat_history = load_state()
+    file_id, state = load_state()
 
     if not file_id:
         return jsonify({"answer": "No document has been uploaded yet."})
 
-    vectordb_dir = os.path.join(VECTORDB_FOLDER, file_id)
-    if not os.path.exists(vectordb_dir):
-        return jsonify({"answer": "Document processing failed or expired."})
+    pdf_text = state.get("text", "")
+    chat_history = state.get("chat_history", [])
 
-    # Optionally re-process document for safety
-    pdf_path = None
-    uploads = os.listdir(UPLOAD_FOLDER)
-    for fname in uploads:
-        if fname.startswith(file_id):
-            pdf_path = os.path.join(UPLOAD_FOLDER, fname)
-            break
-    if pdf_path and os.path.exists(pdf_path):
-        process_document(pdf_path, vectordb_dir)
+    if "summary" in user_input.lower():
+        # Generate a summary using the HuggingFace API
+        try:
+            answer = summarize_with_huggingface(user_input + "\n" + pdf_text)
+        except Exception as e:
+            answer = f"Error generating summary: {str(e)}"
+    else:
+        # Generate a response based on the full extracted text
+        answer = f"Response for question: '{user_input}' based on extracted text: {pdf_text}"
 
-    qa_chain = get_qa_chain(vectordb_dir)
-    output = qa_chain.invoke({"question": user_input, "chat_history": chat_history})
-    answer = output["result"]
     chat_history.append((user_input, answer))
-    save_state(file_id, chat_history)  # Save updated chat history
+    save_state(file_id, {"text": pdf_text, "chat_history": chat_history})
     return jsonify({"answer": answer})
 
 @app.route("/uploads/<filename>")
