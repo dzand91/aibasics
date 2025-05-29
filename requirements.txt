@@ -1,0 +1,10 @@
+flask
+flask-session
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+sentence-transformers
+chromadb
+pypdf
+torch
